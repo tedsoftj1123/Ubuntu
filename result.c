@@ -1,11 +1,12 @@
+#include <ctype.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <unistd.h>
-#include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #define MAX_SW_BLOCKS 10
 #define MAX_PARAMETERS 3
@@ -21,32 +22,22 @@ typedef struct {
 
 SWBlock blocks[MAX_SW_BLOCKS];
 int sw_block_count;
-char termination_reason[256];
 char *time_string;
 
-// 함수 선언
-void run_sw_block(SWBlock *block);
+void run_sw_block(SWBlock *block, int init);
 void trim_str(char *str);
 void print_current_sw_block_status();
-void handle_sigchld();
 void init_sigaction();
+void handle_sigchld(int signum);
 int read_sw_blocks(FILE *file, SWBlock *blocks);
-int find_sw_block_by_name(char *name);
-void terminate_sw_block();
+FILE* create_and_initialize_log();
 
 int main() {
-    // 로그파일 생성
-    FILE *initialize_log = fopen("log.txt", "w");
-    if (initialize_log == NULL) {
-        perror("fopen");
-        exit(1);
-    } else {
-        fprintf(initialize_log, "S/W Block Name | Restart Count |       Start Time       | Reason\n");
-        fprintf(initialize_log, "-----------------------------------------------------------------\n");
-        fclose(initialize_log);
-    }
+    // 로그파일 생성 및 초기화
+    FILE* initialize_log = create_and_initialize_log();
+    fclose(initialize_log);
 
-    // SwBlock 초기회
+    // SwBlock 초기화
     FILE *file = fopen("FileList.txt", "r");
     if (file == NULL) {
         perror("fopen");
@@ -59,31 +50,38 @@ int main() {
     // SwBlock 프로세스 생성
     init_sigaction();
     for (int i = 0; i < sw_block_count; i++) {
-        run_sw_block(&blocks[i]);
+        run_sw_block(&blocks[i], 1);
     }
 
     // Signal 대기
     while (1) {
-        terminate_sw_block();
         sleep(1);
     }
 }
 
+void run_sw_block(SWBlock *block, int init) {
+    if (init)
+        printf("%s is initializing...\n", block->name);
+    else
+        printf("%s is restarting...\n", block->name);
 
-void run_sw_block(SWBlock *block) {
-    printf("%s is initializing...\n", block->name);
+    block->last_restart_time = time(NULL);
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("fork");
         exit(1);
-    } else if (pid == 0) { // Child Process
-        while (1) {
-            sleep(1);
-        }
-    } else { // Parent Process
+    } else if (pid == 0) { // 자식 프로세스
+        srand(time(NULL) * getpid());
+        int sleep_duration = rand() % 5 + 1;
+        sleep(sleep_duration);
+
+        int signals[] = {SIGINT, SIGUSR1, SIGQUIT, SIGTERM, SIGSTOP};
+        int rand_signal_index = rand() % (sizeof(signals) / sizeof(int));
+        int rand_signal = signals[rand_signal_index];
+        kill(getpid(), rand_signal);
+    } else { // 부모 프로세스
         block->pid = pid;
-        block->last_restart_time = time(NULL);
     }
 }
 
@@ -110,7 +108,7 @@ void print_current_sw_block_status() {
     printf("\n\n");
 }
 
-void handle_sigchld() {
+void handle_sigchld(int signum) {
     int status;
     pid_t pid;
 
@@ -128,7 +126,15 @@ void handle_sigchld() {
             block->restart_count++;
             block->last_restart_time = time(NULL);
 
-            FILE *log = fopen("log.txt", "a");
+            if (WIFEXITED(status)) { // 자식프로세스가 정상종료된 경우
+                snprintf(block->restart_reason, sizeof(block->restart_reason), "Exited with status %d", WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) { // 자식프로세스가 시그널에 의해 종료된 경우
+                snprintf(block->restart_reason, sizeof(block->restart_reason), "%s", strsignal(WTERMSIG(status)));
+            } else {
+                strcpy(block->restart_reason, "Unknown");
+            }
+
+            FILE *log = fopen("./log/restart.txt", "a");
             if (log == NULL) {
                 perror("fopen");
                 exit(1);
@@ -143,7 +149,7 @@ void handle_sigchld() {
             print_current_sw_block_status();
 
             // 블록 재초기화
-            run_sw_block(block);
+            run_sw_block(block, 0);
         } else {
             printf("Child process %d terminated\n", pid);
         }
@@ -184,35 +190,17 @@ int read_sw_blocks(FILE *file, SWBlock *blocks) {
     return idx;
 }
 
-int find_sw_block_by_name(char *name) {
-    for(int i = 0; i < sw_block_count; i++) {
-        if(strcmp(blocks[i].name, name) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
+FILE* create_and_initialize_log() {
+    mkdir("log", 0755);
+    FILE *log = fopen("./log/restart.txt", "w");
 
-void terminate_sw_block() {
-    char block_name_to_terminate[20];
-
-    printf("\n\nEnter the S/W Block name to terminate: ");
-    scanf("%19s", block_name_to_terminate);
-    getchar();
-
-    int block_idx = find_sw_block_by_name(block_name_to_terminate);
-
-    if(block_idx != -1) {
-        printf("Enter the reason for terminating the S/W Block %s: ", block_name_to_terminate);
-        fgets(termination_reason, sizeof(termination_reason), stdin);
-        trim_str(termination_reason);
-        strcpy(blocks[block_idx].restart_reason, termination_reason);
-
-        kill(blocks[block_idx].pid, SIGTERM);
-        printf("Terminating process with S/W Block name: %s\n", block_name_to_terminate);
-
+    if (log == NULL) {
+        perror("fopen");
+        exit(1);
     } else {
-        printf("S/W Block name not found: %s\n", block_name_to_terminate);
+        fprintf(log, "S/W Block Name | Restart Count |       Start Time       | Reason\n");
+        fprintf(log, "-----------------------------------------------------------------\n");
     }
-}
 
+    return log;
+}
